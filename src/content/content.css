@@ -1,0 +1,217 @@
+:root {
+  --ruyi-surface: rgba(14, 22, 36, 0.94);
+  --ruyi-surface-soft: rgba(248, 244, 234, 0.94);
+  --ruyi-accent: #ff7a18;
+  --ruyi-accent-strong: #ff5400;
+  --ruyi-text: #f6f0e8;
+  --ruyi-text-muted: rgba(246, 240, 232, 0.74);
+  --ruyi-border: rgba(255, 255, 255, 0.14);
+  --ruyi-shadow: 0 18px 46px rgba(0, 0, 0, 0.22);
+}
+
+.ruyi-floating-panel {
+  position: fixed;
+  right: 24px;
+  bottom: 28px;
+  z-index: 2147483647;
+  width: fit-content;
+  border: 1px solid var(--ruyi-border);
+  border-radius: 999px;
+  background: linear-gradient(145deg, rgba(12, 20, 33, 0.98), rgba(27, 37, 54, 0.94));
+  box-shadow: var(--ruyi-shadow);
+  color: var(--ruyi-text);
+  font-family: "Avenir Next", "Segoe UI", sans-serif;
+  user-select: none;
+  overflow: hidden;
+  backdrop-filter: blur(14px);
+}
+
+.ruyi-floating-panel[data-busy="true"] {
+  box-shadow: 0 18px 46px rgba(255, 122, 24, 0.28);
+}
+
+.ruyi-compact-bar {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 6px;
+  cursor: grab;
+}
+
+.ruyi-side-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  align-items: center;
+}
+
+.ruyi-compact-bar:active {
+  cursor: grabbing;
+}
+
+.ruyi-floating-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px 8px;
+  background: linear-gradient(135deg, rgba(255, 122, 24, 0.18), transparent 72%);
+}
+
+.ruyi-brand {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ruyi-brand-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.ruyi-brand-subtitle {
+  font-size: 10px;
+  color: var(--ruyi-text-muted);
+}
+
+.ruyi-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 50px;
+  padding: 4px 7px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--ruyi-text-muted);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.ruyi-floating-details {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.ruyi-floating-body {
+  padding: 0 12px 12px;
+}
+
+.ruyi-status {
+  min-height: 30px;
+  margin: 0 0 8px;
+  color: var(--ruyi-text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.ruyi-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.ruyi-primary,
+.ruyi-secondary,
+.ruyi-expand,
+.ruyi-close {
+  border: 0;
+  border-radius: 999px;
+  font: inherit;
+  cursor: pointer;
+  padding: 0;
+}
+
+.ruyi-primary {
+  width: 34px;
+  min-width: 34px;
+  height: 34px;
+  min-height: 34px;
+  background: linear-gradient(135deg, var(--ruyi-accent), var(--ruyi-accent-strong));
+  color: #fff6ee;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.ruyi-secondary {
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  min-height: 30px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--ruyi-text);
+  font-size: 13px;
+}
+
+.ruyi-expand {
+  width: 24px;
+  min-width: 24px;
+  height: 24px;
+  min-height: 24px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--ruyi-text);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.ruyi-close {
+  width: 18px;
+  min-width: 18px;
+  height: 18px;
+  min-height: 18px;
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(246, 240, 232, 0.8);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.ruyi-primary:hover,
+.ruyi-secondary:hover,
+.ruyi-expand:hover,
+.ruyi-close:hover {
+  filter: brightness(1.06);
+}
+
+.ruyi-translation-block {
+  display: block;
+  clear: both;
+  max-width: 100%;
+  margin: 0.65em 0 0;
+  white-space: pre-wrap;
+}
+
+.ruyi-translation-block[data-state="streaming"] {
+  position: relative;
+  min-height: 1em;
+  opacity: 0.82;
+}
+
+.ruyi-translation-block[data-state="streaming"]::before {
+  content: "";
+  display: inline-block;
+  width: 0.9em;
+  height: 0.9em;
+  border: 2px solid rgba(125, 170, 224, 0.28);
+  border-top-color: rgba(92, 153, 225, 0.95);
+  border-radius: 999px;
+  animation: ruyi-spinner 0.72s linear infinite;
+}
+
+.ruyi-translation-block[data-state="error"] {
+  color: #772f29;
+}
+
+.ruyi-translation-block[data-hidden="true"] {
+  display: none;
+}
+
+@keyframes ruyi-spinner {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
