@@ -83,13 +83,15 @@
 
   const INLINE_SKIP_SELECTOR = [
     "button",
-    "code",
     "pre",
-    "kbd",
-    "samp",
-    "math",
     "script",
     "style"
+  ].join(",");
+  const PRESERVED_INLINE_SELECTOR = [
+    "code",
+    "kbd",
+    "samp",
+    "math"
   ].join(",");
 
   const SEMANTIC_SKIP_PATTERN = /(nav|menu|header|footer|sidebar|comment|social|share|toolbar|breadcrumb|pagination|related|recommend|advert|ads|promo|banner|subscribe|cookie|consent|modal|popup|drawer|toc)/i;
@@ -126,6 +128,12 @@
   const MIN_TEXT_LENGTH = 36;
   const MIN_HEADING_LENGTH = 8;
   const MAX_BATCH_SIZE = 6;
+  const DEBUG_NOISY_SKIP_REASONS = new Set([
+    "owned-by-extension",
+    "empty-analysis-text",
+    "not-html-element"
+  ]);
+  const DEBUG_SKIP_HISTORY_LIMIT = 200;
 
   const state = {
     enabled: false,
@@ -145,14 +153,19 @@
     observer: null,
     mutationObserver: null,
     drag: null,
+    debugSeen: new WeakMap(),
+    debugEntries: [],
+    debugCounts: new Map(),
     config: {
       maxBatchChars: 2200,
       targetLanguage: "简体中文",
-      hasApiKey: false
+      hasApiKey: false,
+      debug: false
     }
   };
 
   globalThis.__ruyiTranslateController = state;
+  globalThis.__ruyiTranslateDebug = createDebugHelpers();
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!message || typeof message.type !== "string") {
@@ -459,16 +472,20 @@
       const unitIds = [];
 
       for (const extraction of extractions) {
-        if (!isCandidateElement(element, extraction)) {
+        const evaluation = evaluateCandidateElement(element, extraction);
+        if (!evaluation.ok) {
+          debugSkippedCandidate(element, extraction, evaluation.reason, evaluation.meta);
           continue;
         }
 
         const text = extraction.text;
         if (!text) {
+          debugSkippedCandidate(element, extraction, "empty-text");
           continue;
         }
 
         if (shouldSkipDuplicateCandidate(root, element, extraction, seenTextsByRoot)) {
+          debugSkippedCandidate(element, extraction, "duplicate-candidate", { rootTagName: root.tagName });
           continue;
         }
 
@@ -478,6 +495,8 @@
           id: createUnitId(),
           element,
           text,
+          analysisText: getExtractionAnalysisText(extraction),
+          placeholders: extraction.placeholders || [],
           sourceMode: extraction.mode,
           boundaryAnchor: extraction.boundaryAnchor || null,
           insertionAnchor: extraction.insertionAnchor || null,
@@ -520,7 +539,7 @@
   }
 
   function shouldSkipDuplicateCandidate(root, element, extraction, seenTextsByRoot) {
-    const text = normalizeText(extraction.text);
+    const text = normalizeText(getExtractionAnalysisText(extraction));
     if (!text) {
       return true;
     }
@@ -538,7 +557,7 @@
       return false;
     }
 
-    return extraction.mode !== "full" || isHeadingElement(element) || isHeadingLikeElement(element, extraction.text) || text.length <= 220;
+    return extraction.mode !== "full" || isHeadingElement(element) || isHeadingLikeElement(element, getExtractionAnalysisText(extraction)) || text.length <= 220;
   }
 
   function rememberCandidateText(seenTextsByRoot, root, text) {
@@ -551,65 +570,81 @@
     bucket.add(normalizeText(text));
   }
 
-  function isBasicCandidateElement(element, extraction) {
+  function evaluateBasicCandidateElement(element, extraction) {
     if (!(element instanceof HTMLElement)) {
-      return false;
+      return { ok: false, reason: "not-html-element" };
     }
 
     if (!isReadableBlockElement(element, extraction)) {
-      return false;
+      return { ok: false, reason: "not-readable-block" };
     }
 
-    const isHeading = isHeadingElement(element) || isHeadingLikeElement(element, extraction.text);
+    const isHeading = isHeadingElement(element) || isHeadingLikeElement(element, getExtractionAnalysisText(extraction));
 
     if (element.closest(OWNED_SELECTOR)) {
-      return false;
+      return { ok: false, reason: "owned-by-extension" };
     }
 
     if (isMailAppPage() && element.closest(APP_CHROME_SELECTOR)) {
-      return false;
+      return { ok: false, reason: "mail-app-chrome" };
     }
 
     if (element.closest(SKIP_ANCESTOR_SELECTOR)) {
-      return false;
+      return { ok: false, reason: "skip-ancestor" };
     }
 
     const semanticLabel = `${element.id} ${element.className} ${element.getAttribute("role") || ""}`;
     if (!isHeading && SEMANTIC_SKIP_PATTERN.test(semanticLabel)) {
-      return false;
+      return { ok: false, reason: "semantic-skip-pattern", meta: { semanticLabel } };
     }
 
-    if (element.querySelector("pre, code, kbd, samp, math")) {
-      return false;
+    if (element.querySelector("pre")) {
+      return { ok: false, reason: "contains-pre" };
     }
 
     const rect = element.getBoundingClientRect();
     if (rect.width < 120 || rect.height < 16) {
-      return false;
+      return {
+        ok: false,
+        reason: "too-small",
+        meta: { width: Math.round(rect.width), height: Math.round(rect.height) }
+      };
     }
 
     const style = window.getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden") {
-      return false;
+      return {
+        ok: false,
+        reason: "hidden",
+        meta: { display: style.display, visibility: style.visibility }
+      };
     }
 
-    const text = extraction.text;
+    const text = getExtractionAnalysisText(extraction);
     if (!text) {
-      return false;
+      return { ok: false, reason: "empty-analysis-text" };
     }
 
     const minLength = isHeading ? MIN_HEADING_LENGTH : MIN_TEXT_LENGTH;
     if (text.length < minLength) {
-      return false;
+      return {
+        ok: false,
+        reason: "below-min-length",
+        meta: { textLength: text.length, minLength }
+      };
     }
 
     if (isProbablyCode(text)) {
-      return false;
+      return { ok: false, reason: "looks-like-code" };
     }
 
     const punctuationCount = (text.match(/[，。！？；：,.!?;:]/g) || []).length;
-    if (!isHeading && punctuationCount < 1) {
-      return false;
+    if (!isHeading && punctuationCount < 1 && !isPunctuationOptionalCandidate(element, text)) {
+      return {
+        ok: false,
+        reason: "missing-punctuation",
+        meta: { punctuationCount, textLength: text.length }
+      };
     }
 
     const anchors = Array.from(element.querySelectorAll("a"));
@@ -619,36 +654,91 @@
       .trim();
 
     if (!isHeading && shouldSkipLinkHeavyBlock(element, text, anchors, anchorText)) {
-      return false;
+      return {
+        ok: false,
+        reason: "link-heavy-block",
+        meta: { anchorCount: anchors.length, anchorTextLength: anchorText.length, textLength: text.length }
+      };
     }
 
-    return true;
+    return { ok: true };
   }
 
-  function isCandidateElement(element, extraction) {
-    if (!isBasicCandidateElement(element, extraction)) {
-      return false;
+  function isBasicCandidateElement(element, extraction) {
+    return evaluateBasicCandidateElement(element, extraction).ok;
+  }
+
+  function evaluateCandidateElement(element, extraction) {
+    const basic = evaluateBasicCandidateElement(element, extraction);
+    if (!basic.ok) {
+      return basic;
     }
 
-    const text = extraction.text;
+    const text = getExtractionAnalysisText(extraction);
 
     if (extraction.mode === "full" && hasEquivalentReadableChild(element, text)) {
-      return false;
+      return { ok: false, reason: "covered-by-equivalent-child" };
     }
 
     if (extraction.mode === "full" && hasReadableChildBlock(element)) {
-      return false;
+      return { ok: false, reason: "has-readable-child-block" };
     }
 
     if (extraction.mode !== "full" && hasEquivalentDescendantExtraction(element, extraction)) {
-      return false;
+      return { ok: false, reason: "covered-by-descendant-extraction" };
     }
 
-    return true;
+    return { ok: true };
+  }
+
+  function isCandidateElement(element, extraction) {
+    return evaluateCandidateElement(element, extraction).ok;
   }
 
   function isHeadingElement(element) {
     return /^H[1-6]$/.test(element.tagName);
+  }
+
+  function isListLikeElement(element) {
+    return /^(LI|DD|DT)$/.test(element.tagName);
+  }
+
+  function isPunctuationOptionalCandidate(element, text) {
+    if (isListLikeElement(element)) {
+      return true;
+    }
+
+    if (!isParagraphLikeElement(element)) {
+      return false;
+    }
+
+    if (isHeadingLikeElement(element, text)) {
+      return false;
+    }
+
+    return isSentenceLikeText(text);
+  }
+
+  function isParagraphLikeElement(element) {
+    return /^(P|BLOCKQUOTE|DIV|SECTION|ARTICLE|TD|SPAN|FIGCAPTION)$/.test(element.tagName);
+  }
+
+  function isSentenceLikeText(text) {
+    const cjkCount = (text.match(/[\u3400-\u9fff]/g) || []).length;
+    if (cjkCount >= 10 && text.length >= 16) {
+      return true;
+    }
+
+    const words = text.match(/[A-Za-z]+(?:['’-][A-Za-z]+)*/g) || [];
+    if (words.length < 4 || text.length < 24) {
+      return false;
+    }
+
+    const lowercaseWords = words.filter((word) => /[a-z]/.test(word) && word !== word.toUpperCase());
+    const stopwordHits = text.match(/\b(a|an|the|and|or|of|to|for|with|in|on|by|from|is|are|was|were|be|been|being|it|its|their|this|that|these|those|as|at|into|than|then|if|but|not|often|sometimes|between|multiple|other)\b/gi) || [];
+    const hasMixedCase = /[A-Z]/.test(text) && /[a-z]/.test(text);
+
+    return lowercaseWords.length >= 2 || stopwordHits.length >= 1 || hasMixedCase;
   }
 
   function isHeadingLikeElement(element, text = "") {
@@ -785,17 +875,22 @@
     const boundaryAnchor = findBlockBoundary(element);
     if (boundaryAnchor) {
       const leadingText = extractLeadingInlineText(element);
-      if (leadingText) {
+      if (leadingText.text) {
         return [{
-          text: leadingText,
+          text: leadingText.text,
+          analysisText: leadingText.analysisText,
+          placeholders: leadingText.placeholders,
           mode: "leading-inline",
           boundaryAnchor
         }];
       }
     }
 
+    const fullText = extractTranslatableText(element);
     return [{
-      text: extractTranslatableText(element),
+      text: fullText.text,
+      analysisText: fullText.analysisText,
+      placeholders: fullText.placeholders,
       mode: "full",
       boundaryAnchor: null
     }];
@@ -821,6 +916,8 @@
 
     return segments.map((segment) => ({
       text: segment.text,
+      analysisText: segment.analysisText,
+      placeholders: segment.placeholders,
       mode: "virtual-block",
       boundaryAnchor: segment.boundaryAnchor || null,
       insertionAnchor: segment.insertionAnchor || null
@@ -828,12 +925,14 @@
   }
 
   function extractVirtualInlineBlockSegments(element) {
-    const segments = [{ parts: [], insertionAnchor: null, boundaryAnchor: null }];
+    const segments = [createInlineSegment()];
     collectInlineSegments(element, segments);
 
     return segments
       .map((segment) => ({
-        text: segment.parts.join(" ").replace(/\s*\n\s*/g, " ").replace(/[ \t]+/g, " ").trim(),
+        text: normalizeCollectedParts(segment.requestParts),
+        analysisText: normalizeCollectedParts(segment.analysisParts),
+        placeholders: segment.placeholders,
         insertionAnchor: segment.insertionAnchor,
         boundaryAnchor: segment.boundaryAnchor
       }))
@@ -843,10 +942,7 @@
   function collectInlineSegments(node, segments) {
     for (const child of node.childNodes) {
       if (child.nodeType === Node.TEXT_NODE) {
-        const value = child.nodeValue?.replace(/\s+/g, " ").trim();
-        if (value) {
-          segments[segments.length - 1].parts.push(value);
-        }
+        appendNormalizedText(child.nodeValue, getCurrentSegment(segments).requestParts, getCurrentSegment(segments).analysisParts);
         continue;
       }
 
@@ -860,17 +956,22 @@
       }
 
       if (element.matches(BLOCK_TRANSLATION_BOUNDARY_SELECTOR)) {
-        if (segments[segments.length - 1].parts.length > 0) {
-          segments[segments.length - 1].boundaryAnchor = element;
+        if (getCurrentSegment(segments).requestParts.length > 0) {
+          getCurrentSegment(segments).boundaryAnchor = element;
         }
         return true;
       }
 
       if (element.tagName === "BR") {
-        if (segments[segments.length - 1].parts.length > 0) {
-          segments[segments.length - 1].insertionAnchor = element;
-          segments.push({ parts: [], insertionAnchor: null, boundaryAnchor: null });
+        if (getCurrentSegment(segments).requestParts.length > 0) {
+          getCurrentSegment(segments).insertionAnchor = element;
+          segments.push(createInlineSegment());
         }
+        continue;
+      }
+
+      if (element.matches(PRESERVED_INLINE_SELECTOR)) {
+        appendPreservedInlineElement(element, getCurrentSegment(segments));
         continue;
       }
 
@@ -895,23 +996,18 @@
   }
 
   function extractLeadingInlineText(element) {
-    const parts = [];
-    collectLeadingInlineParts(element, parts);
+    const requestParts = [];
+    const analysisParts = [];
+    const placeholders = createPlaceholderState();
+    collectLeadingInlineParts(element, requestParts, analysisParts, placeholders);
 
-    return parts
-      .join(" ")
-      .replace(/\s*\n\s*/g, "\n")
-      .replace(/[ \t]+/g, " ")
-      .trim();
+    return createExtractionResult(requestParts, analysisParts, placeholders.items, true);
   }
 
-  function collectLeadingInlineParts(node, parts) {
+  function collectLeadingInlineParts(node, requestParts, analysisParts, placeholders) {
     for (const child of node.childNodes) {
       if (child.nodeType === Node.TEXT_NODE) {
-        const value = child.nodeValue?.replace(/\s+/g, " ").trim();
-        if (value) {
-          parts.push(value);
-        }
+        appendNormalizedText(child.nodeValue, requestParts, analysisParts);
         continue;
       }
 
@@ -929,9 +1025,20 @@
       }
 
       if (element.tagName === "BR") {
-        if (parts.length > 0 && parts[parts.length - 1] !== "\n") {
-          parts.push("\n");
+        if (requestParts.length > 0 && requestParts[requestParts.length - 1] !== "\n") {
+          requestParts.push("\n");
+          analysisParts.push("\n");
         }
+        continue;
+      }
+
+      if (element.matches(PRESERVED_INLINE_SELECTOR)) {
+        appendPreservedInlineElement(element, {
+          requestParts,
+          analysisParts,
+          placeholderState: placeholders,
+          placeholders: placeholders.items
+        });
         continue;
       }
 
@@ -939,7 +1046,7 @@
         continue;
       }
 
-      if (collectLeadingInlineParts(element, parts)) {
+      if (collectLeadingInlineParts(element, requestParts, analysisParts, placeholders)) {
         return true;
       }
     }
@@ -948,44 +1055,244 @@
   }
 
   function extractTranslatableText(element) {
-    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, {
-      acceptNode(node) {
-        const parent = node.parentElement;
-        if (!parent) {
-          return NodeFilter.FILTER_REJECT;
-        }
-
-        if (parent.closest(OWNED_SELECTOR)) {
-          return NodeFilter.FILTER_REJECT;
-        }
-
-        if (parent.closest(INLINE_SKIP_SELECTOR)) {
-          return NodeFilter.FILTER_REJECT;
-        }
-
-        const value = node.nodeValue?.replace(/\s+/g, " ").trim();
-        if (!value) {
-          return NodeFilter.FILTER_REJECT;
-        }
-
-        return NodeFilter.FILTER_ACCEPT;
-      }
-    });
-
-    const parts = [];
-    let node;
-    while ((node = walker.nextNode())) {
-      const value = node.nodeValue.replace(/\s+/g, " ").trim();
-      if (value) {
-        parts.push(value);
-      }
-    }
-
-    return parts.join(" ").trim();
+    const requestParts = [];
+    const analysisParts = [];
+    const placeholders = createPlaceholderState();
+    collectTranslatableParts(element, requestParts, analysisParts, placeholders);
+    return createExtractionResult(requestParts, analysisParts, placeholders.items);
   }
 
   function normalizeText(text) {
     return text.replace(/\s+/g, " ").trim();
+  }
+
+  function getExtractionAnalysisText(extraction) {
+    return extraction.analysisText || extraction.text || "";
+  }
+
+  function createExtractionResult(requestParts, analysisParts, placeholders, preserveLineBreaks = false) {
+    return {
+      text: normalizeCollectedParts(requestParts, preserveLineBreaks),
+      analysisText: normalizeCollectedParts(analysisParts, preserveLineBreaks),
+      placeholders
+    };
+  }
+
+  function normalizeCollectedParts(parts, preserveLineBreaks = false) {
+    if (!parts || parts.length === 0) {
+      return "";
+    }
+
+    const joined = parts.join(" ");
+    if (preserveLineBreaks) {
+      return joined.replace(/\s*\n\s*/g, "\n").replace(/[ \t]+/g, " ").trim();
+    }
+
+    return joined.replace(/\s*\n\s*/g, " ").replace(/[ \t]+/g, " ").trim();
+  }
+
+  function createPlaceholderState() {
+    return {
+      nextId: 1,
+      items: []
+    };
+  }
+
+  function appendNormalizedText(value, requestParts, analysisParts) {
+    const normalized = value?.replace(/\s+/g, " ").trim();
+    if (!normalized) {
+      return;
+    }
+
+    requestParts.push(normalized);
+    analysisParts.push(normalized);
+  }
+
+  function appendPreservedInlineElement(element, segment) {
+    const value = normalizeText(element.innerText || element.textContent || "");
+    if (!value) {
+      return;
+    }
+
+    const token = `__RUYI_PRESERVE_${segment.placeholderState.nextId}__`;
+    segment.placeholderState.nextId += 1;
+    segment.placeholders.push({ token, value });
+    segment.requestParts.push(token);
+    segment.analysisParts.push(value);
+  }
+
+  function collectTranslatableParts(node, requestParts, analysisParts, placeholders) {
+    for (const child of node.childNodes) {
+      if (child.nodeType === Node.TEXT_NODE) {
+        appendNormalizedText(child.nodeValue, requestParts, analysisParts);
+        continue;
+      }
+
+      if (child.nodeType !== Node.ELEMENT_NODE) {
+        continue;
+      }
+
+      const element = child;
+      if (element.closest(OWNED_SELECTOR)) {
+        continue;
+      }
+
+      if (element.matches(PRESERVED_INLINE_SELECTOR)) {
+        appendPreservedInlineElement(element, {
+          requestParts,
+          analysisParts,
+          placeholderState: placeholders,
+          placeholders: placeholders.items
+        });
+        continue;
+      }
+
+      if (element.matches(INLINE_SKIP_SELECTOR)) {
+        continue;
+      }
+
+      collectTranslatableParts(element, requestParts, analysisParts, placeholders);
+    }
+  }
+
+  function createInlineSegment() {
+    return {
+      requestParts: [],
+      analysisParts: [],
+      placeholders: [],
+      placeholderState: createPlaceholderState(),
+      insertionAnchor: null,
+      boundaryAnchor: null
+    };
+  }
+
+  function getCurrentSegment(segments) {
+    return segments[segments.length - 1];
+  }
+
+  function debugSkippedCandidate(element, extraction, reason, meta = null) {
+    if (!state.config.debug || !(element instanceof HTMLElement)) {
+      return;
+    }
+
+    if (DEBUG_NOISY_SKIP_REASONS.has(reason)) {
+      return;
+    }
+
+    const signature = `${reason}::${extraction.mode || "unknown"}`;
+    let seenReasons = state.debugSeen.get(element);
+    if (!seenReasons) {
+      seenReasons = new Set();
+      state.debugSeen.set(element, seenReasons);
+    }
+
+    if (seenReasons.has(signature)) {
+      return;
+    }
+
+    seenReasons.add(signature);
+
+    const text = getExtractionAnalysisText(extraction);
+    const entry = createDebugEntry(element, extraction, reason, text, meta);
+    rememberDebugEntry(entry);
+
+    const summary = {
+      reason,
+      locator: entry.locator,
+      mode: entry.mode,
+      textLength: entry.textLength,
+      textPreview: entry.textPreview,
+      searchText: entry.searchText,
+      meta: meta || undefined,
+      element
+    };
+
+    console.debug("[Ruyi Translate] Candidate skipped", summary);
+  }
+
+  function createDebugEntry(element, extraction, reason, text, meta) {
+    return {
+      reason,
+      mode: extraction.mode || "unknown",
+      textLength: text.length,
+      textPreview: text.slice(0, 140),
+      searchText: buildSearchText(text),
+      locator: describeElement(element),
+      meta: meta || null,
+      element,
+      timestamp: Date.now()
+    };
+  }
+
+  function rememberDebugEntry(entry) {
+    state.debugEntries.unshift(entry);
+    if (state.debugEntries.length > DEBUG_SKIP_HISTORY_LIMIT) {
+      state.debugEntries.length = DEBUG_SKIP_HISTORY_LIMIT;
+    }
+
+    state.debugCounts.set(entry.reason, (state.debugCounts.get(entry.reason) || 0) + 1);
+  }
+
+  function createDebugHelpers() {
+    return {
+      findSkipped(query) {
+        const keyword = normalizeText(String(query || "")).toLowerCase();
+        if (!keyword) {
+          return [];
+        }
+
+        return state.debugEntries.filter((entry) => {
+          return entry.textPreview.toLowerCase().includes(keyword)
+            || entry.searchText.toLowerCase().includes(keyword)
+            || entry.locator.toLowerCase().includes(keyword)
+            || entry.reason.toLowerCase().includes(keyword);
+        });
+      },
+      skippedSummary() {
+        return Array.from(state.debugCounts.entries())
+          .sort((left, right) => right[1] - left[1])
+          .map(([reason, count]) => ({ reason, count }));
+      },
+      recentSkipped(limit = 20) {
+        const safeLimit = Math.max(1, Math.min(Number(limit) || 20, 100));
+        return state.debugEntries.slice(0, safeLimit);
+      },
+      describeElement(element = globalThis.$0) {
+        return element instanceof HTMLElement ? describeElement(element) : null;
+      }
+    };
+  }
+
+  function buildSearchText(text) {
+    return normalizeText(text)
+      .replace(/[^\p{L}\p{N}\s-]/gu, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 200);
+  }
+
+  function describeElement(element) {
+    const segments = [];
+    let current = element;
+    let depth = 0;
+
+    while (current instanceof HTMLElement && depth < 4) {
+      segments.push(describeSingleElement(current));
+      current = current.parentElement;
+      depth += 1;
+    }
+
+    return segments.join(" <- ");
+  }
+
+  function describeSingleElement(element) {
+    const tag = element.tagName.toLowerCase();
+    const id = element.id ? `#${element.id}` : "";
+    const classes = typeof element.className === "string"
+      ? element.className.trim().split(/\s+/).filter(Boolean).slice(0, 3).map((name) => `.${name}`).join("")
+      : "";
+    const role = element.getAttribute("role") ? `[role=${element.getAttribute("role")}]` : "";
+    return `${tag}${id}${classes}${role}`;
   }
 
   function isReadableBlockElement(element, extraction) {
@@ -1020,7 +1327,7 @@
         continue;
       }
 
-      const text = normalizeText(extractTranslatableText(child));
+      const text = normalizeText(extractTranslatableText(child).analysisText);
       const minLength = isHeadingElement(child) ? MIN_HEADING_LENGTH : MIN_TEXT_LENGTH;
       if (text.length >= minLength) {
         return true;
@@ -1050,7 +1357,7 @@
         continue;
       }
 
-      const childText = normalizeText(extractTranslatableText(child));
+      const childText = normalizeText(extractTranslatableText(child).analysisText);
       if (!childText) {
         continue;
       }
@@ -1069,7 +1376,7 @@
   }
 
   function hasEquivalentDescendantExtraction(element, extraction) {
-    const normalized = normalizeText(extraction.text);
+    const normalized = normalizeText(getExtractionAnalysisText(extraction));
     if (!normalized) {
       return false;
     }
@@ -1094,7 +1401,7 @@
           continue;
         }
 
-        if (normalizeText(childExtraction.text) !== normalized) {
+        if (normalizeText(getExtractionAnalysisText(childExtraction)) !== normalized) {
           continue;
         }
 
@@ -1259,10 +1566,10 @@
       return;
     }
 
-    unit.translation = text;
+    unit.translation = restorePreservedPlaceholders(text, unit.placeholders);
     unit.status = "translated";
     unit.error = "";
-    ensureTranslationNode(unit, text);
+    ensureTranslationNode(unit, unit.translation);
     unit.translationNode.dataset.state = "translated";
     unit.translationNode.dataset.hidden = state.enabled ? "false" : "true";
     renderStatus();
@@ -1297,7 +1604,7 @@
 
     if (unit.sourceMode === "leading-inline" && unit.boundaryAnchor) {
       return {
-        tagName: isHeadingElement(element) || isHeadingLikeElement(element, unit.text) ? "p" : "div",
+        tagName: isHeadingElement(element) || isHeadingLikeElement(element, unit.analysisText) ? "p" : "div",
         mode: "before-boundary",
         anchor: unit.boundaryAnchor
       };
@@ -1460,6 +1767,29 @@
 
   function createBatchId() {
     return `batch-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
+  }
+
+  function restorePreservedPlaceholders(text, placeholders) {
+    let restored = text;
+
+    for (const placeholder of placeholders || []) {
+      restored = restored.replace(createPlaceholderPattern(placeholder.token), () => placeholder.value);
+    }
+
+    return restored;
+  }
+
+  function createPlaceholderPattern(token) {
+    const match = token.match(/^__RUYI_PRESERVE_(\d+)__$/);
+    if (!match) {
+      return new RegExp(escapeRegExp(token), "g");
+    }
+
+    return new RegExp(`__\\s*RUYI_PRESERVE_${match[1]}\\s*__`, "g");
+  }
+
+  function escapeRegExp(value) {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
 
   function clamp(value, min, max) {
