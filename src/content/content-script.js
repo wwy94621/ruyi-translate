@@ -124,7 +124,6 @@
     'div[data-app-section="MailReadCompose"]'
   ];
   const OWNED_SELECTOR = "[data-ruyi-owned='true']";
-  const PANEL_AUTO_SHOW_DISABLED_KEY = "panelAutoShowDisabled";
   const MIN_TEXT_LENGTH = 36;
   const MIN_HEADING_LENGTH = 8;
   const MAX_BATCH_SIZE = 6;
@@ -138,6 +137,7 @@
   const state = {
     enabled: false,
     busyCount: 0,
+    surfaceMode: detectSurfaceMode(),
     panel: null,
     panelVisible: false,
     autoShowDisabled: false,
@@ -167,6 +167,8 @@
   globalThis.__ruyiTranslateController = state;
   globalThis.__ruyiTranslateDebug = createDebugHelpers();
 
+  removeStaleOwnedNodes();
+
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!message || typeof message.type !== "string") {
       return;
@@ -178,7 +180,7 @@
     }
 
     if (message.type === "ruyi/toggle-translation") {
-      toggleTranslation();
+      void handlePrimaryAction();
       sendResponse({ ok: true });
       return;
     }
@@ -249,7 +251,23 @@
   createFloatingPanel();
   watchDomMutations();
   loadConfig();
-  loadPanelPreference();
+  showPanel();
+
+  function removeStaleOwnedNodes() {
+    const staleNodes = document.querySelectorAll(OWNED_SELECTOR);
+    for (const node of staleNodes) {
+      node.remove();
+    }
+  }
+
+  async function handlePrimaryAction() {
+    if (state.surfaceMode === "pdf") {
+      await openPdfMode();
+      return;
+    }
+
+    toggleTranslation();
+  }
 
   function toggleTranslation() {
     state.enabled = !state.enabled;
@@ -283,24 +301,9 @@
     }
   }
 
-  async function loadPanelPreference() {
-    try {
-      const data = await chrome.storage.local.get([PANEL_AUTO_SHOW_DISABLED_KEY]);
-      state.autoShowDisabled = Boolean(data[PANEL_AUTO_SHOW_DISABLED_KEY]);
-    } catch (error) {
-      console.warn("Failed to load panel preference", error);
-      state.autoShowDisabled = false;
-    } finally {
-      if (!state.autoShowDisabled) {
-        showPanel();
-      } else {
-        hidePanel();
-      }
-    }
-  }
-
   function showPanel() {
     state.panelVisible = true;
+    state.autoShowDisabled = false;
 
     if (state.panel) {
       state.panel.hidden = false;
@@ -318,14 +321,6 @@
   async function dismissPanel() {
     hidePanel();
     state.autoShowDisabled = true;
-
-    try {
-      await chrome.storage.local.set({
-        [PANEL_AUTO_SHOW_DISABLED_KEY]: true
-      });
-    } catch (error) {
-      console.warn("Failed to save panel preference", error);
-    }
   }
 
   function createFloatingPanel() {
@@ -342,7 +337,9 @@
     const primaryButton = document.createElement("button");
     primaryButton.className = "ruyi-primary";
     primaryButton.type = "button";
-    primaryButton.addEventListener("click", toggleTranslation);
+    primaryButton.addEventListener("click", () => {
+      void handlePrimaryAction();
+    });
 
     const expandButton = document.createElement("button");
     expandButton.className = "ruyi-expand";
@@ -1736,6 +1733,8 @@
 
     if (overrideMessage) {
       state.statusNode.textContent = overrideMessage;
+    } else if (state.surfaceMode === "pdf") {
+      state.statusNode.textContent = "当前是浏览器内置 PDF 页面。点击主按钮后会切换到专用 PDF 翻译页。";
     } else if (!hasConfig) {
       state.statusNode.textContent = "还没有配置模型信息。点击右侧设置按钮填写 API URL、Key 和模型名。";
     } else if (!state.enabled) {
@@ -1750,7 +1749,9 @@
       state.statusNode.textContent = "未发现可翻译正文，或当前视口附近还没有满足启发式规则的内容。";
     }
 
-    if (!state.enabled) {
+    if (state.surfaceMode === "pdf") {
+      state.chipNode.textContent = "PDF";
+    } else if (!state.enabled) {
       state.chipNode.textContent = "待命";
     } else if (state.busyCount > 0 || queueCount > 0) {
       state.chipNode.textContent = "翻译中";
@@ -1767,6 +1768,125 @@
 
   function createBatchId() {
     return `batch-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
+  }
+
+  async function openPdfMode() {
+    const source = resolvePdfSourceFromPage();
+    if (!source) {
+      renderStatus("没有识别到 PDF 地址。", true);
+      return;
+    }
+
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "ruyi/open-pdf-viewer",
+        sourceUrl: source,
+        title: document.title || ""
+      });
+
+      if (!response?.ok) {
+        throw new Error(response?.error || "打开 PDF 模式失败");
+      }
+    } catch (error) {
+      renderStatus(error?.message || "打开 PDF 模式失败", true);
+    }
+  }
+
+  function detectSurfaceMode() {
+    return resolvePdfSourceFromPage() ? "pdf" : "html";
+  }
+
+  function resolvePdfSourceFromPage() {
+    const candidates = [window.location.href, window.location.search, window.location.hash];
+    const selectors = [
+      'embed[type="application/pdf"]',
+      'iframe[src*=".pdf"]',
+      'embed[src*=".pdf"]',
+      'object[data*=".pdf"]'
+    ];
+
+    for (const selector of selectors) {
+      const node = document.querySelector(selector);
+      if (!(node instanceof Element)) {
+        continue;
+      }
+
+      const source = node.getAttribute("src") || node.getAttribute("data");
+      if (source) {
+        candidates.push(source);
+      }
+    }
+
+    for (const candidate of candidates) {
+      const resolved = resolvePdfSourceFromUrl(candidate);
+      if (resolved) {
+        return resolved;
+      }
+    }
+
+    const documentContentType = String(document.contentType || "").toLowerCase();
+    if (documentContentType.includes("pdf")) {
+      const fallback = normalizePossibleUrl(window.location.href);
+      if (fallback) {
+        return fallback;
+      }
+    }
+
+    return "";
+  }
+
+  function resolvePdfSourceFromUrl(rawUrl) {
+    if (!rawUrl) {
+      return "";
+    }
+
+    const normalized = normalizePossibleUrl(rawUrl);
+    if (!normalized) {
+      return "";
+    }
+
+    if (/\.pdf($|[?#])/i.test(normalized)) {
+      return normalized;
+    }
+
+    const parsed = safeParseUrl(normalized);
+    if (!parsed) {
+      return "";
+    }
+
+    for (const key of ["file", "src", "url", "source"]) {
+      const nested = normalizePossibleUrl(parsed.searchParams.get(key));
+      if (nested && /\.pdf($|[?#])/i.test(nested)) {
+        return nested;
+      }
+    }
+
+    return "";
+  }
+
+  function normalizePossibleUrl(value) {
+    if (typeof value !== "string") {
+      return "";
+    }
+
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return "";
+    }
+
+    try {
+      return decodeURIComponent(trimmed);
+    } catch (error) {
+      return trimmed;
+    }
+  }
+
+  function safeParseUrl(rawUrl) {
+    try {
+      return new URL(rawUrl);
+    } catch (error) {
+      return null;
+    }
   }
 
   function restorePreservedPlaceholders(text, placeholders) {

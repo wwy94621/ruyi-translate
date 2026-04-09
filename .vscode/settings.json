@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^cd '/Users/wangwenyu/Documents/Source Code/ruyi-translate' && cp node_modules/pdfjs-dist/build/pdf\\.mjs src/vendor/pdf\\.mjs && cp node_modules/pdfjs-dist/build/pdf\\.worker\\.min\\.mjs src/vendor/pdf\\.worker\\.min\\.mjs$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

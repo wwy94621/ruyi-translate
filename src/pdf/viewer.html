@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ruyi Translate PDF</title>
+    <link rel="stylesheet" href="./viewer.css" />
+  </head>
+  <body>
+    <div class="pdf-app">
+      <header class="pdf-toolbar">
+        <div class="pdf-toolbar__group">
+          <button id="sidebar-toggle" class="pdf-icon-button" type="button" aria-label="切换侧边栏" title="切换侧边栏">☰</button>
+          <div class="pdf-page-nav">
+            <button id="prev-page-button" class="pdf-icon-button" type="button" aria-label="上一页">‹</button>
+            <label class="pdf-page-nav__field" aria-label="当前页码">
+              <input id="current-page-input" type="number" min="1" step="1" value="1" />
+              <span>/ <strong id="page-count">-</strong></span>
+            </label>
+            <button id="next-page-button" class="pdf-icon-button" type="button" aria-label="下一页">›</button>
+          </div>
+          <div class="pdf-toolbar__divider" aria-hidden="true"></div>
+          <strong id="document-title" class="pdf-toolbar__title">加载 PDF 中...</strong>
+        </div>
+
+        <div class="pdf-toolbar__group pdf-toolbar__group--end">
+          <span id="toolbar-chip" class="pdf-toolbar__chip">初始化</span>
+          <span class="pdf-toolbar__stat">已译 <strong id="translated-count">0</strong></span>
+          <button id="toggle-button" class="pdf-button pdf-button--primary" type="button" title="开始或停止翻译">译</button>
+          <button id="options-button" class="pdf-icon-button" type="button" aria-label="设置" title="设置">⚙</button>
+        </div>
+      </header>
+
+      <div id="workspace" class="pdf-workspace" data-sidebar-open="false">
+        <aside id="sidebar" class="pdf-sidebar">
+          <div class="pdf-sidebar__tabs">
+            <button id="sidebar-pages-tab" class="pdf-sidebar__tab" type="button" data-active="true">页面</button>
+            <button id="sidebar-outline-tab" class="pdf-sidebar__tab" type="button" data-active="false">目录</button>
+          </div>
+          <div id="page-nav-list" class="pdf-sidebar__panel"></div>
+          <div id="outline-list" class="pdf-sidebar__panel" hidden></div>
+        </aside>
+
+        <main class="pdf-main">
+          <section class="pdf-document-shell">
+            <div id="viewer-root" class="pdf-viewer-root"></div>
+          </section>
+        </main>
+      </div>
+    </div>
+
+    <template id="page-template">
+      <section class="pdf-page-shell" data-page-shell>
+        <div class="pdf-page-shell__source">
+          <div class="pdf-page-shell__header">
+            <span class="pdf-page-shell__badge" data-page-label></span>
+            <span class="pdf-page-shell__hint">原文页</span>
+          </div>
+          <div class="pdf-page-stage" data-page-stage>
+            <canvas class="pdf-page-canvas" data-page-canvas></canvas>
+            <div class="pdf-page-overlay" data-page-overlay></div>
+          </div>
+        </div>
+        <div class="pdf-page-shell__translation">
+          <div class="pdf-page-shell__header pdf-page-shell__header--translation">
+            <span class="pdf-page-shell__badge pdf-page-shell__badge--translation">译文页</span>
+            <span data-page-note-stats class="pdf-page-shell__hint">等待扫描</span>
+          </div>
+          <div class="pdf-translation-sheet" data-translation-sheet>
+            <div class="pdf-page-notes-fixed" data-page-notes-fixed></div>
+            <div class="pdf-page-notes" data-page-notes></div>
+          </div>
+        </div>
+      </section>
+    </template>
+
+    <template id="note-template">
+      <article class="pdf-note" data-note>
+        <p class="pdf-note__source" data-note-source></p>
+        <div class="pdf-note__translation" data-note-translation></div>
+      </article>
+    </template>
+
+    <script type="module" src="./viewer.js"></script>
+  </body>
+</html>

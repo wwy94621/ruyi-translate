@@ -2,15 +2,18 @@
   "manifest_version": 3,
   "name": "Ruyi Translate",
   "description": "按视口翻译网页核心内容，并保留原文对照。",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "host_permissions": [
+    "file:///*",
     "http://*/*",
     "https://*/*"
   ],
   "permissions": [
     "activeTab",
+    "contextMenus",
     "scripting",
-    "storage"
+    "storage",
+    "tabs"
   ],
   "content_scripts": [
     {
@@ -33,5 +36,15 @@
   "action": {
     "default_title": "Ruyi Translate"
   },
-  "options_page": "src/options/options.html"
+  "options_page": "src/options/options.html",
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "src/vendor/pdf.worker.min.mjs"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
 }
