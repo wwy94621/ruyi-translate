@@ -12,7 +12,6 @@ const PDF_VIEWER_URL = chrome.runtime.getURL(PDF_VIEWER_PATH);
 const DEBUG_LOG_KEY = "ruyiDebugLog";
 const DEBUG_LOG_LIMIT = 120;
 const DEBUG_LAST_EVENT_KEY = "ruyiDebugLastEvent";
-const ACTIVATE_CONTEXT_MENU_ID = "ruyi-activate";
 
 void debugLog("service-worker-started", {
   version: chrome.runtime.getManifest().version,
@@ -34,15 +33,9 @@ chrome.runtime.onInstalled.addListener(async ({ reason }) => {
     await chrome.storage.sync.set(nextConfig);
   }
 
-  await ensureContextMenu();
-
   if (reason === chrome.runtime.OnInstalledReason.INSTALL) {
     chrome.runtime.openOptionsPage();
   }
-});
-
-chrome.runtime.onStartup.addListener(() => {
-  void ensureContextMenu();
 });
 
 chrome.action.onClicked.addListener(async (tab) => {
@@ -51,14 +44,6 @@ chrome.action.onClicked.addListener(async (tab) => {
   }
 
   await activateForTab(tab, "action");
-});
-
-chrome.contextMenus.onClicked.addListener((info, tab) => {
-  if (info.menuItemId !== ACTIVATE_CONTEXT_MENU_ID || !tab?.id) {
-    return;
-  }
-
-  void activateForTab(tab, "context-menu");
 });
 
 async function activateForTab(tab, trigger) {
@@ -670,24 +655,6 @@ function mergeTabSnapshot(primary, secondary) {
     discarded: Boolean(primary.discarded || secondary.discarded),
     index: Number.isInteger(secondary.index) ? secondary.index : primary.index
   };
-}
-
-async function ensureContextMenu() {
-  try {
-    await chrome.contextMenus.remove(ACTIVATE_CONTEXT_MENU_ID).catch(() => {});
-    await chrome.contextMenus.create({
-      id: ACTIVATE_CONTEXT_MENU_ID,
-      title: "使用 Ruyi Translate 翻译当前页面/PDF",
-      contexts: ["page", "selection", "link", "image"]
-    });
-    await debugLog("context-menu-ready", {
-      menuId: ACTIVATE_CONTEXT_MENU_ID
-    });
-  } catch (error) {
-    await debugLog("context-menu-failed", {
-      error: serializeError(error)
-    });
-  }
 }
 
 async function setDebugBadge(text, color) {

@@ -15,6 +15,15 @@ const TABLE_REGION_PADDING = 6;
 const RASTER_DARK_THRESHOLD = 170;
 const RASTER_GAP_TOLERANCE = 2;
 const RASTER_NEIGHBOR_RADIUS = 1;
+const COLUMN_GUTTER_BIN_COUNT = 48;
+const MIN_COLUMN_SIDE_ITEMS = 6;
+const MIN_COLUMN_VERTICAL_OVERLAP_RATIO = 0.18;
+const MIN_STRUCTTREE_COVERAGE = 0.8;
+const MIN_GUTTER_WIDTH = 18;
+const MAX_GUTTER_WIDTH_RATIO = 0.18;
+const WIDE_ITEM_WIDTH_RATIO = 0.72;
+const WIDE_LAYOUT_ITEM_RATIO = 0.22;
+const POSITION_Y_TOLERANCE = 2;
 const DRAW_OP_MOVE_TO = 0;
 const DRAW_OP_LINE_TO = 1;
 const DRAW_OP_CURVE_TO = 2;
@@ -22,53 +31,129 @@ const DRAW_OP_QUADRATIC_CURVE_TO = 3;
 const DRAW_OP_CLOSE_PATH = 4;
 const IDENTITY_MATRIX = [1, 0, 0, 1, 0, 0];
 
-export function buildPageSegments(textContent, viewport, operatorList, canvas) {
-  const diagnostics = createSegmentationDiagnostics();
-  const textItems = Array.isArray(textContent?.items) ? textContent.items : [];
-  const positionedItems = textItems
-    .map((item) => toPositionedItem(item, viewport))
-    .filter(Boolean)
-    .sort((left, right) => {
-      if (Math.abs(left.top - right.top) > 2) {
-        return left.top - right.top;
-      }
+export function buildPageSegments(textContent, viewport, operatorList, canvas, options = {}) {
+  const diagnostics = createSegmentationDiagnostics(options);
+  const { positionedItems, totalRawItems } = extractPositionedItems(textContent, viewport);
+  diagnostics.totalRawItems = totalRawItems;
+  diagnostics.totalTextItems = positionedItems.length;
 
-      return left.left - right.left;
-    });
+  const visibleItems = positionedItems.filter((item) => !item.isArtifact);
+  const logicalItems = visibleItems.length > 0 ? visibleItems : positionedItems;
+  const readingOrder = resolveReadingOrder(logicalItems, viewport, options.structTree, diagnostics);
+  const flowBlocks = readingOrder.blocks.length > 0
+    ? readingOrder.blocks
+    : [createFlowBlock("page", "single", sortPositionedItems(logicalItems), viewport.width, { label: "page" })];
 
-  const lines = buildLines(positionedItems);
-  const pageMetrics = buildPageMetrics(lines, viewport.width);
-  diagnostics.pageMetrics = pageMetrics;
-  diagnostics.lines = lines.map((line) => serializeLineForDiagnostics(line));
-  const operatorTableRegions = detectRuledTableRegions(positionedItems, lines, viewport, operatorList);
-  const rasterTableRegions = operatorTableRegions.length === 0
-    ? detectRasterTableRegions(positionedItems, lines, viewport, canvas)
-    : [];
-  const ruledTableRegions = [...operatorTableRegions, ...rasterTableRegions];
-  const tableRegions = detectTableRegions(lines).filter((region) => !overlapsRuledRegion(region, lines, ruledTableRegions));
-  diagnostics.tableRegions = [
-    ...tableRegions.map((region) => ({ type: "text", start: region.start, end: region.end })),
-    ...ruledTableRegions.map((region) => ({ type: "ruled", start: region.start, end: region.end }))
-  ];
-  const segments = buildSegmentsWithTables(lines, pageMetrics, tableRegions, ruledTableRegions, diagnostics);
-  diagnostics.segments = segments.map((segment) => serializeSegmentForDiagnostics(segment));
+  diagnostics.readingOrderStrategy = readingOrder.strategy;
+  diagnostics.fallbackReason = readingOrder.fallbackReason || null;
+  diagnostics.structTreeCoverage = roundForDebug(readingOrder.structTreeCoverage || 0);
+  diagnostics.gutterCandidates = readingOrder.gutterCandidates || [];
+  diagnostics.flowBlocks = flowBlocks.map((block) => serializeFlowBlockForDiagnostics(block));
+
+  const aggregation = buildSegmentsFromFlowBlocks(flowBlocks, viewport, operatorList, canvas, diagnostics);
+  diagnostics.pageMetrics = aggregation.pageMetrics;
+  diagnostics.lines = aggregation.lines.map((line) => serializeLineForDiagnostics(line));
+  diagnostics.tableRegions = aggregation.tableRegions;
+  diagnostics.segments = aggregation.segments.map((segment) => serializeSegmentForDiagnostics(segment));
+
   return {
-    segments,
+    segments: aggregation.segments,
     diagnostics
   };
 }
 
-function createSegmentationDiagnostics() {
+function createSegmentationDiagnostics(options = {}) {
+  const documentCapabilities = options.documentCapabilities || {};
+
   return {
     pageMetrics: null,
     lines: [],
     transitions: [],
     segments: [],
-    tableRegions: []
+    tableRegions: [],
+    readingOrderStrategy: "geometry-single",
+    fallbackReason: null,
+    structTreeCoverage: 0,
+    gutterCandidates: [],
+    flowBlocks: [],
+    totalRawItems: 0,
+    totalTextItems: 0,
+    documentCapabilities: {
+      hasStructTree: Boolean(documentCapabilities.hasStructTree),
+      marked: Boolean(documentCapabilities.markInfo?.Marked)
+    }
   };
 }
 
-function toPositionedItem(item, viewport) {
+function extractPositionedItems(textContent, viewport) {
+  const rawItems = Array.isArray(textContent?.items) ? textContent.items : [];
+  const positionedItems = [];
+  const markedContentStack = [];
+
+  for (let rawIndex = 0; rawIndex < rawItems.length; rawIndex += 1) {
+    const rawItem = rawItems[rawIndex];
+    if (typeof rawItem?.str !== "string") {
+      updateMarkedContentStack(markedContentStack, rawItem);
+      continue;
+    }
+
+    const context = buildMarkedContentContext(markedContentStack);
+    const positionedItem = toPositionedItem(rawItem, viewport, rawIndex, context);
+    if (positionedItem) {
+      positionedItems.push(positionedItem);
+    }
+  }
+
+  return {
+    positionedItems,
+    totalRawItems: rawItems.length
+  };
+}
+
+function updateMarkedContentStack(stack, item) {
+  if (!item || typeof item.type !== "string") {
+    return;
+  }
+
+  if (item.type === "beginMarkedContent" || item.type === "beginMarkedContentProps") {
+    stack.push({
+      id: typeof item.id === "string" ? item.id : null,
+      tag: typeof item.tag === "string" ? item.tag : null
+    });
+    return;
+  }
+
+  if (item.type === "endMarkedContent" && stack.length > 0) {
+    stack.pop();
+  }
+}
+
+function buildMarkedContentContext(stack) {
+  const contentIds = [];
+  const markedTags = [];
+  let isArtifact = false;
+
+  for (const entry of stack) {
+    if (entry?.id) {
+      contentIds.push(entry.id);
+    }
+
+    if (entry?.tag) {
+      markedTags.push(entry.tag);
+      if (entry.tag === "Artifact") {
+        isArtifact = true;
+      }
+    }
+  }
+
+  return {
+    contentIds,
+    markedTags,
+    isArtifact
+  };
+}
+
+function toPositionedItem(item, viewport, rawIndex = 0, context = null) {
   if (!item || typeof item.str !== "string") {
     return null;
   }
@@ -78,25 +163,661 @@ function toPositionedItem(item, viewport) {
     return null;
   }
 
-  const [left, baselineY] = viewport.convertToViewportPoint(item.transform[4], item.transform[5]);
-  const roughHeight = Math.max(10, (item.height || 0) * viewport.scale || Math.abs(item.transform[0]) * viewport.scale || 12);
+  const transform = Array.isArray(item.transform) ? item.transform : IDENTITY_MATRIX;
+  const [left, baselineY] = viewport.convertToViewportPoint(transform[4] || 0, transform[5] || 0);
+  const roughHeight = Math.max(10, (item.height || 0) * viewport.scale || Math.abs(transform[3]) * viewport.scale || Math.abs(transform[0]) * viewport.scale || 12);
   const roughWidth = Math.max(6, (item.width || normalizedText.length * 6) * viewport.scale);
   const top = Math.max(0, baselineY - roughHeight);
+  const contentIds = Array.isArray(context?.contentIds) ? context.contentIds.slice() : [];
 
   return {
     text: normalizedText,
     left,
     top,
+    baselineY,
     width: roughWidth,
     height: roughHeight,
     right: left + roughWidth,
     bottom: top + roughHeight,
-    hasEol: Boolean(item.hasEOL)
+    hasEol: Boolean(item.hasEOL),
+    rawIndex,
+    originalWidth: item.width || 0,
+    originalHeight: item.height || 0,
+    contentIds,
+    primaryContentId: contentIds[contentIds.length - 1] || null,
+    markedTags: Array.isArray(context?.markedTags) ? context.markedTags.slice() : [],
+    isArtifact: Boolean(context?.isArtifact)
   };
 }
 
-function buildLines(items) {
+function resolveReadingOrder(items, viewport, structTree, diagnostics) {
+  let structFallbackReason = null;
+
+  if (structTree) {
+    const structuredOrder = buildStructTreeFlowBlocks(items, structTree, viewport);
+    if (structuredOrder.accepted) {
+      return structuredOrder;
+    }
+
+    structFallbackReason = structuredOrder.fallbackReason || "struct-tree-unusable";
+  }
+
+  const geometryOrder = buildGeometricFlowBlocks(items, viewport);
+  if (!geometryOrder.fallbackReason && structFallbackReason) {
+    geometryOrder.fallbackReason = structFallbackReason;
+  }
+  return geometryOrder;
+}
+
+function buildStructTreeFlowBlocks(items, structTree, viewport) {
+  const orderedContentIds = collectStructTreeContentIds(structTree);
+  if (orderedContentIds.length === 0) {
+    return {
+      accepted: false,
+      strategy: "struct-tree",
+      blocks: [],
+      structTreeCoverage: 0,
+      gutterCandidates: [],
+      fallbackReason: "struct-tree-empty"
+    };
+  }
+
+  const itemsByContentId = new Map();
+  for (const item of items) {
+    for (const contentId of item.contentIds || []) {
+      if (!itemsByContentId.has(contentId)) {
+        itemsByContentId.set(contentId, []);
+      }
+      itemsByContentId.get(contentId).push(item);
+    }
+  }
+
+  const matchedItems = [];
+  const seenItems = new Set();
+  let matchedContentCount = 0;
+
+  for (const contentId of orderedContentIds) {
+    const bucket = itemsByContentId.get(contentId);
+    if (!bucket || bucket.length === 0) {
+      continue;
+    }
+
+    matchedContentCount += 1;
+    const orderedBucket = bucket.slice().sort(compareStructuredBucketItems);
+    for (const item of orderedBucket) {
+      if (seenItems.has(item.rawIndex)) {
+        continue;
+      }
+
+      seenItems.add(item.rawIndex);
+      matchedItems.push(item);
+    }
+  }
+
+  if (matchedItems.length === 0) {
+    return {
+      accepted: false,
+      strategy: "struct-tree",
+      blocks: [],
+      structTreeCoverage: 0,
+      gutterCandidates: [],
+      fallbackReason: "struct-tree-no-item-match"
+    };
+  }
+
+  const leftovers = items.filter((item) => !seenItems.has(item.rawIndex));
+  const matchedBounds = getItemBounds(matchedItems);
+  const typicalHeight = median(items.map((item) => item.height)) || 12;
+  const leftoverTolerance = Math.max(24, typicalHeight * 2.5);
+  const topLeftovers = [];
+  const bottomLeftovers = [];
+  const middleLeftovers = [];
+
+  for (const item of leftovers) {
+    if (item.bottom <= matchedBounds.top + leftoverTolerance) {
+      topLeftovers.push(item);
+      continue;
+    }
+
+    if (item.top >= matchedBounds.bottom - leftoverTolerance) {
+      bottomLeftovers.push(item);
+      continue;
+    }
+
+    middleLeftovers.push(item);
+  }
+
+  if (middleLeftovers.length > 0) {
+    return {
+      accepted: false,
+      strategy: "struct-tree",
+      blocks: [],
+      structTreeCoverage: matchedItems.length / Math.max(items.length, 1),
+      gutterCandidates: [],
+      fallbackReason: "struct-tree-middle-leftovers"
+    };
+  }
+
+  const orderedItems = [
+    ...sortPositionedItems(topLeftovers),
+    ...matchedItems,
+    ...sortPositionedItems(bottomLeftovers)
+  ];
+  const structTreeCoverage = orderedItems.length / Math.max(items.length, 1);
+
+  if (structTreeCoverage < MIN_STRUCTTREE_COVERAGE) {
+    return {
+      accepted: false,
+      strategy: "struct-tree",
+      blocks: [],
+      structTreeCoverage,
+      gutterCandidates: [],
+      fallbackReason: "struct-tree-low-coverage"
+    };
+  }
+
+  return {
+    accepted: true,
+    strategy: "struct-tree",
+    blocks: [createFlowBlock("struct-tree", "structured", orderedItems, viewport.width, {
+      label: "struct-tree",
+      preserveOrder: true,
+      matchedContentCount,
+      totalContentCount: orderedContentIds.length
+    })],
+    structTreeCoverage,
+    gutterCandidates: [],
+    fallbackReason: null
+  };
+}
+
+function collectStructTreeContentIds(root) {
+  const orderedContentIds = [];
+  const seenContentIds = new Set();
+
+  visitStructTreeNode(root, (node) => {
+    if (node?.type !== "content" || typeof node.id !== "string" || seenContentIds.has(node.id)) {
+      return;
+    }
+
+    seenContentIds.add(node.id);
+    orderedContentIds.push(node.id);
+  });
+
+  return orderedContentIds;
+}
+
+function visitStructTreeNode(node, visitor) {
+  if (!node) {
+    return;
+  }
+
+  visitor(node);
+  if (!Array.isArray(node.children)) {
+    return;
+  }
+
+  for (const child of node.children) {
+    visitStructTreeNode(child, visitor);
+  }
+}
+
+function buildGeometricFlowBlocks(items, viewport) {
+  const singleBlock = [createFlowBlock("page", "single", sortPositionedItems(items), viewport.width, { label: "page" })];
+  const detection = detectColumnFlowBlocks(items, viewport);
+  if (!detection.accepted) {
+    return {
+      strategy: "geometry-single",
+      blocks: singleBlock,
+      structTreeCoverage: 0,
+      gutterCandidates: detection.candidates,
+      fallbackReason: detection.reason || null
+    };
+  }
+
+  return {
+    strategy: "geometry-double-column",
+    blocks: detection.blocks,
+    structTreeCoverage: 0,
+    gutterCandidates: detection.candidates,
+    fallbackReason: null
+  };
+}
+
+function detectColumnFlowBlocks(items, viewport) {
+  const pageWidth = Math.max(1, viewport.width);
+  const pageHeight = Math.max(1, viewport.height || (getItemBounds(items)?.bottom || 0));
+  if (items.length < MIN_COLUMN_SIDE_ITEMS * 2) {
+    return { accepted: false, reason: "insufficient-column-items", candidates: [] };
+  }
+
+  const wideItems = items.filter((item) => item.width >= pageWidth * WIDE_ITEM_WIDTH_RATIO);
+  if (wideItems.length >= Math.max(4, Math.floor(items.length * WIDE_LAYOUT_ITEM_RATIO))) {
+    return { accepted: false, reason: "wide-layout-dominant", candidates: [] };
+  }
+
+  const histogramItems = items.filter((item) => item.width < pageWidth * WIDE_ITEM_WIDTH_RATIO);
+  const histogram = buildHorizontalOccupancyHistogram(histogramItems, pageWidth);
+  const gutterCandidates = [
+    buildClusteredGutterCandidate(histogramItems, pageWidth),
+    ...findGutterCandidates(histogram, pageWidth)
+  ]
+    .filter(Boolean)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 5);
+  if (gutterCandidates.length === 0) {
+    return { accepted: false, reason: "no-gutter-candidate", candidates: [] };
+  }
+
+  let rejectionReason = "column-classification-failed";
+  for (const candidate of gutterCandidates) {
+    const classified = classifyColumnFlowCandidate(items, candidate, pageWidth, pageHeight);
+    if (classified.accepted) {
+      return {
+        accepted: true,
+        reason: null,
+        candidates: gutterCandidates.map((gutter) => serializeGutterCandidate(gutter)),
+        blocks: classified.blocks
+      };
+    }
+
+    rejectionReason = classified.reason || rejectionReason;
+  }
+
+  return {
+    accepted: false,
+    reason: rejectionReason,
+    candidates: gutterCandidates.map((gutter) => serializeGutterCandidate(gutter))
+  };
+}
+
+function buildHorizontalOccupancyHistogram(items, pageWidth) {
+  const histogram = new Array(COLUMN_GUTTER_BIN_COUNT).fill(0);
+  if (items.length === 0) {
+    return histogram;
+  }
+
+  for (const item of items) {
+    const start = Math.max(0, Math.min(COLUMN_GUTTER_BIN_COUNT - 1, Math.floor((item.left / pageWidth) * COLUMN_GUTTER_BIN_COUNT)));
+    const end = Math.max(start, Math.min(COLUMN_GUTTER_BIN_COUNT - 1, Math.floor((item.right / pageWidth) * COLUMN_GUTTER_BIN_COUNT)));
+    for (let bin = start; bin <= end; bin += 1) {
+      histogram[bin] += 1;
+    }
+  }
+
+  return histogram;
+}
+
+function buildClusteredGutterCandidate(items, pageWidth) {
+  const candidateItems = items.filter((item) => item.width < pageWidth * 0.55);
+  if (candidateItems.length < MIN_COLUMN_SIDE_ITEMS * 2) {
+    return null;
+  }
+
+  const midpoint = pageWidth / 2;
+  const leftItems = candidateItems.filter((item) => getItemCenter(item) < midpoint);
+  const rightItems = candidateItems.filter((item) => getItemCenter(item) >= midpoint);
+  if (leftItems.length < MIN_COLUMN_SIDE_ITEMS || rightItems.length < MIN_COLUMN_SIDE_ITEMS) {
+    return null;
+  }
+
+  const leftBoundary = percentile(leftItems.map((item) => item.right), 0.82);
+  const rightBoundary = percentile(rightItems.map((item) => item.left), 0.18);
+  const width = rightBoundary - leftBoundary;
+  const center = (leftBoundary + rightBoundary) / 2;
+  if (!Number.isFinite(width) || width < MIN_GUTTER_WIDTH || width > pageWidth * MAX_GUTTER_WIDTH_RATIO) {
+    return null;
+  }
+
+  if (center < pageWidth * 0.28 || center > pageWidth * 0.72) {
+    return null;
+  }
+
+  return {
+    left: leftBoundary,
+    right: rightBoundary,
+    width,
+    center,
+    averageOccupancy: 0,
+    score: width + 12
+  };
+}
+
+function findGutterCandidates(histogram, pageWidth) {
+  if (!Array.isArray(histogram) || histogram.length === 0) {
+    return [];
+  }
+
+  const maxOccupancy = Math.max(...histogram, 0);
+  if (maxOccupancy <= 0) {
+    return [];
+  }
+
+  const lowThreshold = Math.max(1, Math.floor(maxOccupancy * 0.12));
+  const binWidth = pageWidth / COLUMN_GUTTER_BIN_COUNT;
+  const candidates = [];
+  let rangeStart = -1;
+
+  for (let index = 0; index < histogram.length; index += 1) {
+    if (histogram[index] <= lowThreshold) {
+      if (rangeStart === -1) {
+        rangeStart = index;
+      }
+      continue;
+    }
+
+    if (rangeStart !== -1) {
+      candidates.push(buildGutterCandidate(histogram, rangeStart, index - 1, binWidth, pageWidth));
+      rangeStart = -1;
+    }
+  }
+
+  if (rangeStart !== -1) {
+    candidates.push(buildGutterCandidate(histogram, rangeStart, histogram.length - 1, binWidth, pageWidth));
+  }
+
+  return candidates
+    .filter(Boolean)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 4);
+}
+
+function buildGutterCandidate(histogram, start, end, binWidth, pageWidth) {
+  const left = start * binWidth;
+  const right = (end + 1) * binWidth;
+  const width = right - left;
+  const center = (left + right) / 2;
+  if (width < MIN_GUTTER_WIDTH || width > pageWidth * MAX_GUTTER_WIDTH_RATIO) {
+    return null;
+  }
+
+  if (center < pageWidth * 0.28 || center > pageWidth * 0.72) {
+    return null;
+  }
+
+  const bins = histogram.slice(start, end + 1);
+  const averageOccupancy = bins.reduce((sum, value) => sum + value, 0) / Math.max(bins.length, 1);
+  const score = width - Math.abs(center - pageWidth / 2) * 0.7 - averageOccupancy * 10;
+  return {
+    left,
+    right,
+    width,
+    center,
+    averageOccupancy,
+    score
+  };
+}
+
+function percentile(values, ratio) {
+  if (!Array.isArray(values) || values.length === 0) {
+    return 0;
+  }
+
+  const sorted = values.slice().sort((left, right) => left - right);
+  const index = Math.min(Math.max(0, ratio), 1) * (sorted.length - 1);
+  const lower = Math.floor(index);
+  const upper = Math.ceil(index);
+  if (lower === upper) {
+    return sorted[lower];
+  }
+
+  const weight = index - lower;
+  return sorted[lower] + (sorted[upper] - sorted[lower]) * weight;
+}
+
+function classifyColumnFlowCandidate(items, candidate, pageWidth, pageHeight) {
+  const leftItems = [];
+  const rightItems = [];
+  const crossingItems = [];
+  const gutterCenter = candidate.center;
+
+  for (const item of items) {
+    const gutterOverlap = Math.max(0, Math.min(item.right, candidate.right) - Math.max(item.left, candidate.left));
+    if (gutterOverlap <= Math.max(4, item.width * 0.08)) {
+      if (getItemCenter(item) <= gutterCenter) {
+        leftItems.push(item);
+      } else {
+        rightItems.push(item);
+      }
+      continue;
+    }
+
+    if (item.right <= candidate.left + 6) {
+      leftItems.push(item);
+      continue;
+    }
+
+    if (item.left >= candidate.right - 6) {
+      rightItems.push(item);
+      continue;
+    }
+
+    crossingItems.push(item);
+  }
+
+  if (leftItems.length < MIN_COLUMN_SIDE_ITEMS || rightItems.length < MIN_COLUMN_SIDE_ITEMS) {
+    return { accepted: false, reason: "column-side-too-small" };
+  }
+
+  const leftBounds = getItemBounds(leftItems);
+  const rightBounds = getItemBounds(rightItems);
+  const overlapHeight = Math.min(leftBounds.bottom, rightBounds.bottom) - Math.max(leftBounds.top, rightBounds.top);
+  if (overlapHeight < pageHeight * MIN_COLUMN_VERTICAL_OVERLAP_RATIO) {
+    return { accepted: false, reason: "column-overlap-too-small" };
+  }
+
+  const leftWidth = leftBounds.right - leftBounds.left;
+  const rightWidth = rightBounds.right - rightBounds.left;
+  if (leftWidth < pageWidth * 0.18 || rightWidth < pageWidth * 0.18) {
+    return { accepted: false, reason: "column-width-too-small" };
+  }
+
+  const typicalHeight = median(items.map((item) => item.height)) || 12;
+  const verticalTolerance = Math.max(24, typicalHeight * 2.5);
+  const columnTop = Math.min(leftBounds.top, rightBounds.top);
+  const columnBottom = Math.max(leftBounds.bottom, rightBounds.bottom);
+  const topItems = [];
+  const bottomItems = [];
+  const middleItems = [];
+
+  for (const item of crossingItems) {
+    if (item.bottom <= columnTop + verticalTolerance) {
+      topItems.push(item);
+      continue;
+    }
+
+    if (item.top >= columnBottom - verticalTolerance) {
+      bottomItems.push(item);
+      continue;
+    }
+
+    middleItems.push(item);
+  }
+
+  if (middleItems.length > 0) {
+    return { accepted: false, reason: "midstream-full-width-content" };
+  }
+
+  const blocks = [];
+  if (topItems.length > 0) {
+    blocks.push(createFlowBlock("full-top", "full-width", sortPositionedItems(topItems), pageWidth, { label: "full-top" }));
+  }
+
+  blocks.push(createFlowBlock("left-column", "column", sortPositionedItems(leftItems), pageWidth, { label: "left-column" }));
+  blocks.push(createFlowBlock("right-column", "column", sortPositionedItems(rightItems), pageWidth, { label: "right-column" }));
+
+  if (bottomItems.length > 0) {
+    blocks.push(createFlowBlock("full-bottom", "full-width", sortPositionedItems(bottomItems), pageWidth, { label: "full-bottom" }));
+  }
+
+  return { accepted: true, blocks };
+}
+
+function buildSegmentsFromFlowBlocks(flowBlocks, viewport, operatorList, canvas, diagnostics) {
+  const allSegments = [];
+  const allLines = [];
+  const tableRegions = [];
+  let sourceIndexOffset = 0;
+
+  for (const block of flowBlocks) {
+    if (!Array.isArray(block.items) || block.items.length === 0) {
+      continue;
+    }
+
+    const lines = buildLines(block.items, {
+      sourceIndexOffset,
+      blockId: block.id
+    });
+    sourceIndexOffset += lines.length;
+    if (lines.length === 0) {
+      continue;
+    }
+
+    allLines.push(...lines);
+    const pageMetrics = buildPageMetrics(lines, viewport.width);
+    const operatorTableRegions = block.kind === "column"
+      ? []
+      : detectRuledTableRegions(block.items, lines, viewport, operatorList);
+    const rasterTableRegions = block.kind === "column" || operatorTableRegions.length > 0
+      ? []
+      : detectRasterTableRegions(block.items, lines, viewport, canvas);
+    const ruledTableRegions = [...operatorTableRegions, ...rasterTableRegions];
+    const textTableRegions = detectTableRegions(lines).filter((region) => !overlapsRuledRegion(region, lines, ruledTableRegions));
+
+    tableRegions.push(
+      ...serializeTableRegionsForDiagnostics(textTableRegions, ruledTableRegions, lines, block.id)
+    );
+
+    const blockSegments = buildSegmentsWithTables(lines, pageMetrics, textTableRegions, ruledTableRegions, diagnostics);
+    for (const segment of blockSegments) {
+      segment.blockId = block.id;
+      allSegments.push(segment);
+    }
+  }
+
+  allSegments.forEach((segment, index) => {
+    segment.index = index + 1;
+  });
+
+  return {
+    segments: allSegments,
+    lines: allLines,
+    pageMetrics: buildPageMetrics(allLines, viewport.width),
+    tableRegions
+  };
+}
+
+function serializeTableRegionsForDiagnostics(textRegions, ruledRegions, lines, blockId) {
+  return [
+    ...textRegions.map((region) => ({
+      blockId,
+      type: "text",
+      start: lines[region.start]?.sourceIndex ?? region.start,
+      end: lines[region.end]?.sourceIndex ?? region.end
+    })),
+    ...ruledRegions.map((region) => ({
+      blockId,
+      type: "ruled",
+      start: lines[region.start]?.sourceIndex ?? region.start,
+      end: lines[region.end]?.sourceIndex ?? region.end
+    }))
+  ];
+}
+
+function createFlowBlock(id, kind, items, pageWidth, meta = {}) {
+  const orderedItems = meta.preserveOrder ? items.slice() : sortPositionedItems(items);
+  return {
+    id,
+    kind,
+    items: orderedItems,
+    bounds: getItemBounds(orderedItems),
+    pageWidth,
+    meta
+  };
+}
+
+function getItemBounds(items) {
+  if (!Array.isArray(items) || items.length === 0) {
+    return {
+      top: 0,
+      left: 0,
+      right: 0,
+      bottom: 0
+    };
+  }
+
+  return {
+    top: Math.min(...items.map((item) => item.top)),
+    left: Math.min(...items.map((item) => item.left)),
+    right: Math.max(...items.map((item) => item.right)),
+    bottom: Math.max(...items.map((item) => item.bottom))
+  };
+}
+
+function getItemCenter(item) {
+  return ((item?.left || 0) + (item?.right || 0)) / 2;
+}
+
+function sortPositionedItems(items) {
+  return items.slice().sort(comparePositionedItems);
+}
+
+function comparePositionedItems(left, right) {
+  const topDelta = left.top - right.top;
+  if (Math.abs(topDelta) > POSITION_Y_TOLERANCE) {
+    return topDelta;
+  }
+
+  const leftDelta = left.left - right.left;
+  if (Math.abs(leftDelta) > 1) {
+    return leftDelta;
+  }
+
+  return left.rawIndex - right.rawIndex;
+}
+
+function compareStructuredBucketItems(left, right) {
+  const topDelta = left.top - right.top;
+  if (Math.abs(topDelta) > POSITION_Y_TOLERANCE * 1.5) {
+    return topDelta;
+  }
+
+  const rawDelta = left.rawIndex - right.rawIndex;
+  if (rawDelta !== 0) {
+    return rawDelta;
+  }
+
+  const leftDelta = left.left - right.left;
+  if (Math.abs(leftDelta) > 1) {
+    return leftDelta;
+  }
+
+  return 0;
+}
+
+function compareInlineItems(left, right) {
+  const leftDelta = left.left - right.left;
+  if (Math.abs(leftDelta) > 1) {
+    return leftDelta;
+  }
+
+  return left.rawIndex - right.rawIndex;
+}
+
+function serializeGutterCandidate(candidate) {
+  return {
+    left: roundForDebug(candidate.left),
+    right: roundForDebug(candidate.right),
+    width: roundForDebug(candidate.width),
+    center: roundForDebug(candidate.center),
+    averageOccupancy: roundForDebug(candidate.averageOccupancy)
+  };
+}
+
+function buildLines(items, options = {}) {
   const lines = [];
+  const sourceIndexOffset = Number.isFinite(options.sourceIndexOffset) ? options.sourceIndexOffset : 0;
+  const blockId = typeof options.blockId === "string" ? options.blockId : null;
 
   for (const item of items) {
     const current = lines[lines.length - 1];
@@ -113,12 +834,16 @@ function buildLines(items) {
     .filter((line) => line.text.length > 0)
     .map((line, index) => ({
       ...line,
-      sourceIndex: index
+      sourceIndex: sourceIndexOffset + index,
+      blockId
     }));
 }
 
 function belongsToLine(line, item) {
-  const verticalDrift = Math.abs(item.top - line.top);
+  const verticalDrift = Math.min(
+    Math.abs(item.top - line.top),
+    Math.abs((item.baselineY || item.bottom) - (line.baselineY || line.bottom))
+  );
   return verticalDrift <= Math.max(8, line.height * 0.7);
 }
 
@@ -129,21 +854,24 @@ function createLine(item) {
     left: item.left,
     right: item.right,
     bottom: item.bottom,
-    height: item.height
+    height: item.height,
+    baselineY: item.baselineY
   };
 }
 
 function appendItemToLine(line, item) {
+  const previousCount = line.items.length;
   line.items.push(item);
   line.top = Math.min(line.top, item.top);
   line.left = Math.min(line.left, item.left);
   line.right = Math.max(line.right, item.right);
   line.bottom = Math.max(line.bottom, item.bottom);
   line.height = Math.max(line.height, item.height);
+  line.baselineY = ((line.baselineY || item.baselineY) * previousCount + item.baselineY) / (previousCount + 1);
 }
 
 function finalizeLine(line) {
-  const ordered = line.items.slice().sort((left, right) => left.left - right.left);
+  const ordered = line.items.slice().sort(compareInlineItems);
   const parts = [];
 
   for (let index = 0; index < ordered.length; index += 1) {
@@ -170,7 +898,8 @@ function finalizeLine(line) {
     width: Math.max(0, line.right - line.left),
     height: Math.max(0, line.bottom - line.top),
     endsParagraph: ordered.some((item) => item.hasEol),
-    center: (line.left + line.right) / 2
+    center: (line.left + line.right) / 2,
+    baselineY: line.baselineY
   };
 }
 
@@ -1305,9 +2034,23 @@ function buildInferredColumnWidths(rows, maxCols) {
   return widths.map((value) => value || 72);
 }
 
+function serializeFlowBlockForDiagnostics(block) {
+  const bounds = block?.bounds || { top: 0, left: 0, right: 0, bottom: 0 };
+  return {
+    id: block?.id || "unknown",
+    kind: block?.kind || "unknown",
+    itemCount: Array.isArray(block?.items) ? block.items.length : 0,
+    top: roundForDebug(bounds.top),
+    left: roundForDebug(bounds.left),
+    width: roundForDebug(Math.max(0, bounds.right - bounds.left)),
+    height: roundForDebug(Math.max(0, bounds.bottom - bounds.top))
+  };
+}
+
 function serializeLineForDiagnostics(line) {
   return {
     index: line.sourceIndex,
+    blockId: line.blockId || null,
     text: truncateForDebug(line.text, 160),
     top: roundForDebug(line.top),
     bottom: roundForDebug(line.bottom),
@@ -1321,6 +2064,7 @@ function serializeLineForDiagnostics(line) {
 function serializeSegmentForDiagnostics(segment) {
   return {
     index: segment.index,
+    blockId: segment.blockId || null,
     kind: segment.kind || "text",
     preview: truncateForDebug(segment.preview, 200),
     lineCount: segment.lineCount,

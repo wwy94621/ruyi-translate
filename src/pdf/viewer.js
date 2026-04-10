@@ -1,6 +1,8 @@
 import { GlobalWorkerOptions, getDocument } from "../vendor/pdf.mjs";
 import { buildPageSegments } from "./segmenter.js";
 
+installMapUpsertPolyfill();
+
 const MAX_BATCH_SIZE = 6;
 const PAGE_RENDER_MARGIN = "150% 0px 150% 0px";
 const CURRENT_PAGE_THRESHOLD = [0.2, 0.45, 0.7];
@@ -13,6 +15,12 @@ const state = {
   autoStartRequested: false,
   enabled: false,
   pdfDocument: null,
+  documentCapabilities: {
+    hasStructTree: false,
+    markInfo: null,
+    metadataLoaded: false,
+    metadataError: false
+  },
   outlineItems: [],
   currentPage: 1,
   sidebarView: "pages",
@@ -105,6 +113,28 @@ function bindToolbar() {
   });
 }
 
+function installMapUpsertPolyfill() {
+  if (typeof Map.prototype.getOrInsertComputed === "function") {
+    return;
+  }
+
+  Object.defineProperty(Map.prototype, "getOrInsertComputed", {
+    configurable: true,
+    writable: true,
+    value(key, computeValue) {
+      if (this.has(key)) {
+        return this.get(key);
+      }
+
+      const resolvedValue = typeof computeValue === "function"
+        ? computeValue(key)
+        : computeValue;
+      this.set(key, resolvedValue);
+      return resolvedValue;
+    }
+  });
+}
+
 function bindRuntimeMessages() {
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!message || message.viewerSessionId !== state.viewerSessionId) {
@@ -187,6 +217,16 @@ async function loadDocument() {
 
   const loadingTask = getDocument({ url: state.source, enableXfa: false, useSystemFonts: true });
   state.pdfDocument = await loadingTask.promise;
+  const [{ data: metadata, error: metadataError }, markInfo] = await Promise.all([
+    safeGetPdfMetadata(state.pdfDocument),
+    safeGetPdfMarkInfo(state.pdfDocument)
+  ]);
+  state.documentCapabilities = {
+    hasStructTree: Boolean(metadata?.hasStructTree),
+    markInfo: markInfo || null,
+    metadataLoaded: !metadataError,
+    metadataError: Boolean(metadataError)
+  };
   state.nodes.pageCount.textContent = String(state.pdfDocument.numPages);
 
   createObservers();
@@ -430,11 +470,23 @@ async function renderPage(pageState) {
 
   syncPageThumbnail(pageState);
 
-  const [textContent, operatorList] = await Promise.all([
-    pdfPage.getTextContent(),
-    pdfPage.getOperatorList()
+  const shouldLoadStructTree = state.documentCapabilities.hasStructTree
+    || Boolean(state.documentCapabilities.markInfo?.Marked)
+    || state.documentCapabilities.metadataError
+    || pageState.pageNumber === 1;
+  const [textContent, operatorList, structTree] = await Promise.all([
+    pdfPage.getTextContent({ includeMarkedContent: true }),
+    pdfPage.getOperatorList(),
+    shouldLoadStructTree ? safeGetPageStructTree(pdfPage) : Promise.resolve(null)
   ]);
-  const segmentation = buildPageSegments(textContent, viewport, operatorList, pageState.canvas);
+  if (structTree) {
+    state.documentCapabilities.hasStructTree = true;
+  }
+  const segmentation = buildPageSegments(textContent, viewport, operatorList, pageState.canvas, {
+    pageNumber: pageState.pageNumber,
+    structTree,
+    documentCapabilities: state.documentCapabilities
+  });
   const segments = segmentation.segments;
   pageState.segmentationDebug = segmentation.diagnostics;
   pageState.segmentSummary = summarizeSegments(segments);
@@ -1286,12 +1338,46 @@ function logSegmentationDiagnostics(pageState) {
   console.info("Summary", {
     pageNumber: pageState.pageNumber,
     segmentSummary: pageState.segmentSummary,
+    readingOrderStrategy: diagnostics.readingOrderStrategy,
+    fallbackReason: diagnostics.fallbackReason,
+    structTreeCoverage: diagnostics.structTreeCoverage,
     lineCount: diagnostics.lines.length,
     breakCount: breakTransitions.length,
+    flowBlocks: diagnostics.flowBlocks,
     tableRegions: diagnostics.tableRegions
   });
   if (breakTransitions.length > 0) {
     console.table(breakTransitions);
   }
   console.groupEnd();
+}
+
+async function safeGetPdfMetadata(pdfDocument) {
+  try {
+    return {
+      data: await pdfDocument.getMetadata(),
+      error: null
+    };
+  } catch (error) {
+    return {
+      data: null,
+      error
+    };
+  }
+}
+
+async function safeGetPdfMarkInfo(pdfDocument) {
+  try {
+    return await pdfDocument.getMarkInfo();
+  } catch (error) {
+    return null;
+  }
+}
+
+async function safeGetPageStructTree(pdfPage) {
+  try {
+    return await pdfPage.getStructTree();
+  } catch (error) {
+    return null;
+  }
 }
