@@ -460,7 +460,10 @@ async function renderPage(pageState) {
   pageState.translationSheet.style.minHeight = `${viewport.height}px`;
   pageState.translationSheet.style.maxHeight = `${viewport.height}px`;
 
-  const context = pageState.canvas.getContext("2d", { alpha: false });
+  const context = pageState.canvas.getContext("2d", {
+    alpha: false,
+    willReadFrequently: true
+  });
   context.setTransform(outputScale, 0, 0, outputScale, 0, 0);
 
   await pdfPage.render({
@@ -521,18 +524,21 @@ function hydratePageSegments(pageState, segments) {
   const flowInsets = computeFlowInsets(pageState, units);
   pageState.translationSheet.style.setProperty("--flow-top-inset", `${flowInsets.top.toFixed(3)}px`);
   pageState.translationSheet.style.setProperty("--flow-bottom-inset", `${flowInsets.bottom.toFixed(3)}px`);
+  const flowLayout = prepareFlowLayout(pageState, units, flowInsets);
 
-  let previousBottom = flowInsets.top;
   for (const unit of units) {
     if (unit.placement === "fixed-top" || unit.placement === "fixed-bottom") {
       positionAnchoredUnit(unit);
       pageState.fixedNotes.append(unit.noteNode);
     } else {
+      const track = getFlowTrack(unit, flowLayout);
+      const previousBottom = flowLayout.previousBottomByTrack.get(track) ?? (flowLayout.trackStarts.get(track) || flowInsets.top);
       const sourceGap = Math.max(0, unit.rect.top - previousBottom);
       unit.noteNode.style.setProperty("--source-gap", `${sourceGap.toFixed(3)}px`);
       unit.noteNode.style.removeProperty("--anchor-top");
-      pageState.notes.append(unit.noteNode);
-      previousBottom = unit.rect.top + unit.rect.height;
+      unit.noteNode.dataset.track = track;
+      flowLayout.containers.get(track).append(unit.noteNode);
+      flowLayout.previousBottomByTrack.set(track, unit.rect.top + unit.rect.height);
     }
 
     syncUnitPresentation(unit);
@@ -601,6 +607,7 @@ function createUnit(pageState, segment, index) {
   return {
     id: unitId,
     pageNumber: pageState.pageNumber,
+    pageWidth: pageState.viewport?.width || 0,
     text: segment.text,
     preview: segment.preview,
     status: "idle",
@@ -608,6 +615,7 @@ function createUnit(pageState, segment, index) {
     error: "",
     anchorNode: anchor,
     noteNode,
+    blockId: segment.blockId || "page",
     kind,
     placement,
     role,
@@ -1075,16 +1083,28 @@ function detectSegmentAlignment(pageState, segment, role) {
 
   const left = segment.rect.left;
   const right = segment.rect.left + segment.rect.width;
+  const widthRatio = segment.rect.width / Math.max(pageWidth, 1);
   const center = left + segment.rect.width / 2;
   const centerOffset = Math.abs(center - pageWidth / 2);
   const nearLeft = left <= Math.max(48, pageWidth * 0.12);
   const nearRight = right >= pageWidth - Math.max(48, pageWidth * 0.12);
+  const centerTolerance = Math.max(18, pageWidth * 0.06);
+  const lineCount = Math.max(1, Number(segment.lineCount) || 1);
+  const centeredNarrowBlock = centerOffset <= centerTolerance && widthRatio <= 0.62;
 
-  if (role === "page-marker" || centerOffset <= Math.max(18, pageWidth * 0.06)) {
+  if (role === "page-marker") {
     return "center";
   }
 
-  if (nearRight && !nearLeft) {
+  if (role === "header-like" && centerOffset <= centerTolerance && widthRatio <= 0.88) {
+    return "center";
+  }
+
+  if (centeredNarrowBlock && lineCount <= 2) {
+    return "center";
+  }
+
+  if (nearRight && !nearLeft && widthRatio <= 0.6) {
     return "right";
   }
 
@@ -1113,6 +1133,122 @@ function computeFlowInsets(pageState, units) {
   };
 }
 
+function prepareFlowLayout(pageState, units, flowInsets) {
+  const notesRoot = pageState.notes;
+  notesRoot.replaceChildren();
+
+  const flowUnits = units.filter((unit) => unit.placement === "flow");
+  const leftUnits = flowUnits.filter((unit) => unit.blockId === "left-column");
+  const rightUnits = flowUnits.filter((unit) => unit.blockId === "right-column");
+  const topUnits = flowUnits.filter((unit) => unit.blockId === "full-top");
+  const bottomUnits = flowUnits.filter((unit) => unit.blockId === "full-bottom");
+  const hasDualColumns = leftUnits.length > 0 && rightUnits.length > 0;
+
+  notesRoot.dataset.layout = hasDualColumns ? "columns" : "single";
+
+  if (!hasDualColumns) {
+    return {
+      containers: new Map([["default", notesRoot]]),
+      trackStarts: new Map([["default", flowInsets.top]]),
+      previousBottomByTrack: new Map([["default", flowInsets.top]])
+    };
+  }
+
+  const topSection = document.createElement("div");
+  topSection.className = "pdf-page-notes__section pdf-page-notes__section--top";
+  const columns = document.createElement("div");
+  columns.className = "pdf-page-notes__columns";
+  const leftLane = document.createElement("div");
+  leftLane.className = "pdf-page-notes__lane pdf-page-notes__lane--left";
+  const rightLane = document.createElement("div");
+  rightLane.className = "pdf-page-notes__lane pdf-page-notes__lane--right";
+  const bottomSection = document.createElement("div");
+  bottomSection.className = "pdf-page-notes__section pdf-page-notes__section--bottom";
+
+  columns.append(leftLane, rightLane);
+  notesRoot.append(topSection, columns, bottomSection);
+
+  const leftBounds = getUnitBounds(leftUnits);
+  const rightBounds = getUnitBounds(rightUnits);
+  const topBounds = getUnitBounds(topUnits);
+  const bottomBounds = getUnitBounds(bottomUnits);
+  const columnStart = Math.min(leftBounds.top, rightBounds.top);
+  const columnBottom = Math.max(leftBounds.bottom, rightBounds.bottom);
+  const topStart = topUnits.length > 0 ? topBounds.top : columnStart;
+  const topBottom = topUnits.length > 0 ? topBounds.bottom : flowInsets.top;
+  const bottomStart = bottomUnits.length > 0 ? bottomBounds.top : columnBottom;
+  const gutter = Math.max(18, rightBounds.left - leftBounds.right);
+
+  topSection.style.setProperty("--section-gap", `${Math.max(0, topStart - flowInsets.top).toFixed(3)}px`);
+  columns.style.setProperty("--section-gap", `${Math.max(0, columnStart - Math.max(flowInsets.top, topBottom)).toFixed(3)}px`);
+  bottomSection.style.setProperty("--section-gap", `${Math.max(0, bottomStart - Math.max(columnBottom, topBottom, flowInsets.top)).toFixed(3)}px`);
+  columns.style.gridTemplateColumns = `${Math.max(1, leftBounds.width).toFixed(3)}fr ${Math.max(1, rightBounds.width).toFixed(3)}fr`;
+  columns.style.columnGap = `calc(${gutter.toFixed(3)}px * var(--page-fit-scale))`;
+
+  return {
+    containers: new Map([
+      ["full-top", topSection],
+      ["left-column", leftLane],
+      ["right-column", rightLane],
+      ["full-bottom", bottomSection],
+      ["default", topSection]
+    ]),
+    trackStarts: new Map([
+      ["full-top", topStart],
+      ["left-column", columnStart],
+      ["right-column", columnStart],
+      ["full-bottom", bottomStart],
+      ["default", topStart]
+    ]),
+    previousBottomByTrack: new Map([
+      ["full-top", topStart],
+      ["left-column", columnStart],
+      ["right-column", columnStart],
+      ["full-bottom", bottomStart],
+      ["default", topStart]
+    ])
+  };
+}
+
+function getFlowTrack(unit, flowLayout) {
+  if (!flowLayout.containers.has("left-column") || !flowLayout.containers.has("right-column")) {
+    return "default";
+  }
+
+  if (flowLayout.containers.has(unit.blockId)) {
+    return unit.blockId;
+  }
+
+  return "default";
+}
+
+function getUnitBounds(units) {
+  if (!Array.isArray(units) || units.length === 0) {
+    return {
+      top: 0,
+      left: 0,
+      right: 0,
+      bottom: 0,
+      width: 0,
+      height: 0
+    };
+  }
+
+  const top = Math.min(...units.map((unit) => unit.rect.top));
+  const left = Math.min(...units.map((unit) => unit.rect.left));
+  const right = Math.max(...units.map((unit) => unit.rect.left + unit.rect.width));
+  const bottom = Math.max(...units.map((unit) => unit.rect.top + unit.rect.height));
+
+  return {
+    top,
+    left,
+    right,
+    bottom,
+    width: Math.max(0, right - left),
+    height: Math.max(0, bottom - top)
+  };
+}
+
 function positionAnchoredUnit(unit) {
   unit.noteNode.style.setProperty("--source-gap", "0px");
   unit.noteNode.style.setProperty("--anchor-top", `${unit.rect.top.toFixed(3)}px`);
@@ -1123,21 +1259,26 @@ function positionAnchoredUnit(unit) {
 
 function computeAnchoredFrame(unit) {
   const rect = unit.rect || { left: 0, width: 120 };
+  const pageWidth = Math.max(120, unit.pageWidth || rect.left + rect.width);
+  const horizontalInset = Math.max(20, pageWidth * 0.045);
+  const maxWidth = Math.max(96, pageWidth - horizontalInset * 2);
   const center = rect.left + rect.width / 2;
-  let width = rect.width;
+  let width = Math.min(rect.width, maxWidth);
   let left = rect.left;
 
   if (unit.role === "page-marker") {
-    width = Math.max(64, rect.width + 20);
-    left = center - width / 2;
+    width = Math.min(maxWidth, Math.max(64, rect.width + 20));
+    left = (pageWidth - width) / 2;
   } else if (unit.alignment === "center") {
-    width = Math.max(rect.width, 160);
-    left = center - width / 2;
+    width = Math.min(maxWidth, Math.max(rect.width * 1.12, 220));
+    left = (pageWidth - width) / 2;
   }
 
+  left = clamp(left, 0, Math.max(0, pageWidth - width));
+
   return {
-    left: Math.max(0, left),
-    width: Math.max(48, width)
+    left,
+    width: Math.max(48, Math.min(width, pageWidth))
   };
 }
 

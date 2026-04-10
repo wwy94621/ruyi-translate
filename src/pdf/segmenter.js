@@ -614,19 +614,27 @@ function classifyColumnFlowCandidate(items, candidate, pageWidth, pageHeight) {
 
   const typicalHeight = median(items.map((item) => item.height)) || 12;
   const verticalTolerance = Math.max(24, typicalHeight * 2.5);
-  const columnTop = Math.min(leftBounds.top, rightBounds.top);
-  const columnBottom = Math.max(leftBounds.bottom, rightBounds.bottom);
+  const columnTop = Math.min(
+    percentile(leftItems.map((item) => item.top), 0.18),
+    percentile(rightItems.map((item) => item.top), 0.18)
+  );
+  const columnBottom = Math.max(
+    percentile(leftItems.map((item) => item.bottom), 0.82),
+    percentile(rightItems.map((item) => item.bottom), 0.82)
+  );
+  const topBandLimit = columnTop + Math.max(verticalTolerance * 1.8, pageHeight * 0.12);
+  const bottomBandLimit = columnBottom - Math.max(verticalTolerance * 1.8, pageHeight * 0.08);
   const topItems = [];
   const bottomItems = [];
   const middleItems = [];
 
   for (const item of crossingItems) {
-    if (item.bottom <= columnTop + verticalTolerance) {
+    if (item.bottom <= topBandLimit) {
       topItems.push(item);
       continue;
     }
 
-    if (item.top >= columnBottom - verticalTolerance) {
+    if (item.top >= bottomBandLimit) {
       bottomItems.push(item);
       continue;
     }

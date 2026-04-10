@@ -765,12 +765,22 @@
       return false;
     }
 
+    const nonLinkTextLength = Math.max(0, text.length - Math.min(anchorText.length, text.length));
+
     if (anchors.length === 1 && text.length >= 48) {
       return false;
     }
 
     const uniqueAnchorParents = new Set(anchors.map((anchor) => anchor.parentElement).filter(Boolean));
     if (uniqueAnchorParents.size <= 1 && text.length >= 36) {
+      return false;
+    }
+
+    if (isMailAppPage() && text.length >= 120 && anchors.length <= 8 && nonLinkTextLength >= 32 && isSentenceLikeText(text)) {
+      return false;
+    }
+
+    if (text.length >= 180 && anchors.length <= 6 && nonLinkTextLength >= 48 && isSentenceLikeText(text)) {
       return false;
     }
 
@@ -1115,7 +1125,9 @@
     segment.placeholderState.nextId += 1;
     segment.placeholders.push({ token, value });
     segment.requestParts.push(token);
-    segment.analysisParts.push(value);
+    if (!/^(CODE|KBD|SAMP)$/.test(element.tagName)) {
+      segment.analysisParts.push(value);
+    }
   }
 
   function collectTranslatableParts(node, requestParts, analysisParts, placeholders) {
@@ -1411,9 +1423,19 @@
 
   function isProbablyCode(text) {
     const symbolDensity = (text.match(/[{}()[\];_=<>/\\`$]/g) || []).length / Math.max(text.length, 1);
-    const keywordHits = /\b(function|const|let|var|class|return|import|export|SELECT|INSERT|UPDATE|DELETE|npm|yarn|pnpm)\b/.test(text);
+    const strongKeywordHits = text.match(/\b(function|const|var|SELECT|INSERT|UPDATE|DELETE|npm|npx|yarn|pnpm)\b/gi) || [];
+    const weakKeywordHits = text.match(/\b(let|class|return|import|export)\b/gi) || [];
     const identifierHits = /[a-z]+[A-Z][a-zA-Z]+|[a-zA-Z]+_[a-zA-Z_]+/.test(text);
-    return symbolDensity > 0.09 || (keywordHits && identifierHits);
+    const syntaxHints = /[{};=<>`$]|=>|::/.test(text) || /\b[A-Za-z_$][\w$]*\([^)]*\)/.test(text);
+    const sqlLike = /\b(SELECT|INSERT|UPDATE|DELETE)\b/i.test(text) && /\b(FROM|WHERE|JOIN|INTO|SET|VALUES)\b/i.test(text);
+    const shortCommandLike = /\b(?:npm|npx|yarn|pnpm)\s+(?:run\s+)?[-:@./\w]+/i.test(text) && text.length <= 120;
+
+    return symbolDensity > 0.09
+      || sqlLike
+      || shortCommandLike
+      || (strongKeywordHits.length >= 2 && identifierHits)
+      || (strongKeywordHits.length >= 1 && identifierHits && syntaxHints)
+      || (weakKeywordHits.length >= 2 && identifierHits && syntaxHints);
   }
 
   function ensureObserver() {
@@ -1713,7 +1735,7 @@
       return;
     }
 
-    state.actionButton.textContent = state.enabled ? "中" : "英";
+    state.actionButton.textContent = state.enabled ? "原" : "译";
   }
 
   function renderStatus(overrideMessage) {
